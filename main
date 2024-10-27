@@ -1,0 +1,258 @@
+/*
+README
+-------
+Project: IoT-Based Temperature and Fan Control System
+
+Description:
+This project uses an ESP8266 microcontroller with DHT22 and Firebase to control a fan and relay system based on temperature. 
+An automatic mode controls the fan speed according to temperature, while a manual mode allows for user-defined fan control. 
+The data and control commands are sent and received via Firebase.
+
+Setup:
+1. Replace the placeholder credentials for Wi-Fi and Firebase with your own settings.
+2. Connect the DHT22, relays, and L298N motor driver according to the defined pin configuration.
+
+Instructions:
+- Automatic Mode: Fan speed adjusts automatically based on temperature thresholds.
+- Manual Mode: Control fan status and speed via Firebase.
+
+*/
+
+// Include necessary libraries
+#include <DHT.h>
+#include <ESP8266WiFi.h>
+#include <FirebaseESP8266.h>
+#include <L298N.h>
+
+// Wi-Fi Configuration (replace with actual credentials before use)
+const char* ssid = "YOUR_SSID";         // Wi-Fi SSID (network name)
+const char* password = "YOUR_PASSWORD";  // Wi-Fi password
+
+// Firebase Configuration (replace with actual credentials before use)
+#define FIREBASE_HOST "YOUR_FIREBASE_HOST"
+#define FIREBASE_AUTH "YOUR_FIREBASE_AUTH"
+
+// Pin configuration for DHT22 sensor, relays, and PWM control for fan speed
+#define DHTPIN D2
+#define RELAYPIN1 D6
+#define RELAYPIN2 D7  // Additional relay pin
+#define PWM_PIN D0    // PWM pin for controlling fan speed
+
+DHT dht(DHTPIN, DHT22);
+
+// Motor driver pins for L298N
+#define IN1 D1
+#define IN2 D5
+#define ENA D8
+
+L298N motor(ENA, IN1, IN2);
+
+FirebaseData firebaseData;
+FirebaseConfig config;
+FirebaseAuth auth;
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\nDHT22 Sensor Test");
+
+  // Initialize DHT22 sensor
+  dht.begin();
+
+  // Initialize relays
+  pinMode(RELAYPIN1, OUTPUT);
+  digitalWrite(RELAYPIN1, LOW); // Ensure relay 1 starts in off state
+  pinMode(RELAYPIN2, OUTPUT);
+  digitalWrite(RELAYPIN2, LOW); // Ensure relay 2 starts in off state
+
+  // PWM pin setup for fan speed
+  pinMode(PWM_PIN, OUTPUT);
+
+  // Initialize L298N motor
+  motor.setSpeed(0);
+  motor.stop();
+
+  // Connect to Wi-Fi
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to Wi-Fi");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println();
+  Serial.println("Connected to Wi-Fi");
+
+  // Configure Firebase
+  config.host = FIREBASE_HOST;
+  config.signer.tokens.legacy_token = FIREBASE_AUTH;
+
+  // Initialize Firebase
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  // Retrieve and send MAC Address of ESP8266 to Firebase
+  String macAddress = WiFi.macAddress();
+  if (!sendDataToFirebase("/device/mac_address", macAddress.c_str())) {
+    Serial.println("Failed to send MAC Address to Firebase");
+  } else {
+    Serial.println("MAC Address sent to Firebase");
+  }
+}
+
+void loop() {
+  float temperature = dht.readTemperature();
+  float humidity = dht.readHumidity();
+
+  if (isnan(temperature) || isnan(humidity)) {
+    Serial.println("Failed to read from DHT sensor!");
+    return;
+  }
+
+  // Send data to Firebase
+  if (!sendDataToFirebase("/sensor/humidity", humidity) || !sendDataToFirebase("/sensor/temperature", temperature)) {
+    return;
+  }
+
+  // Read and control relay status from Firebase
+  controlRelay("/relay/status1", RELAYPIN1);
+  controlRelay("/relay/status2", RELAYPIN2);
+
+  // Read automatic mode and fan status from Firebase
+  bool autoMode;
+  if (!getAutoMode(autoMode)) {
+    return;
+  }
+
+  if (autoMode) {
+    // Automatically control fan based on temperature
+    controlFanAuto(temperature);
+  } else {
+    // Manually control fan based on user input
+    controlFanManual();
+  }
+
+  delay(2000); // Delay before the next reading
+}
+
+bool sendDataToFirebase(const char* path, const char* data) {
+  if (Firebase.setString(firebaseData, path, data)) {
+    return true;
+  } else {
+    Serial.print("Failed to send data to ");
+    Serial.print(path);
+    Serial.print(": ");
+    Serial.println(firebaseData.errorReason());
+    return false;
+  }
+}
+
+void controlRelay(const char* path, int pin) {
+  if (Firebase.getInt(firebaseData, path)) {
+    int relayStatus = firebaseData.intData();
+    digitalWrite(pin, relayStatus ? HIGH : LOW); // Adjust logic to open relay when value is 0
+    Serial.print("Relay ");
+    Serial.print(pin);
+    Serial.print(" status updated to: ");
+    Serial.println(relayStatus);
+  } else {
+    Serial.print("Failed to get relay status at ");
+    Serial.print(path);
+    Serial.print(": ");
+    Serial.println(firebaseData.errorReason());
+  }
+}
+
+bool sendDataToFirebase(const char* path, float data) {
+  if (Firebase.setFloat(firebaseData, path, data)) {
+    return true;
+  } else {
+    Serial.print("Failed to send data to ");
+    Serial.print(path);
+    Serial.print(": ");
+    Serial.println(firebaseData.errorReason());
+    return false;
+  }
+}
+
+bool getAutoMode(bool& autoMode) {
+  if (Firebase.getBool(firebaseData, "/fan/auto_mode")) {
+    autoMode = firebaseData.boolData();
+    Serial.print("Fan auto mode updated to: ");
+    Serial.println(autoMode);
+    return true;
+  } else {
+    Serial.print("Failed to get auto mode: ");
+    Serial.println(firebaseData.errorReason());
+    return false;
+  }
+}
+
+void controlFanAuto(float temperature) {
+  if (temperature >= 40.0) { // Level 4 at 40 degrees or higher
+    changeSpeed(3);
+  } else if (temperature >= 30.0) { // Level 3 between 30 and 39.9 degrees
+    changeSpeed(2);
+  } else if (temperature >= 26.0) { // Level 2 between 26 and 29.9 degrees
+    changeSpeed(1);
+  } else { // Turn off fan below 26 degrees
+    motor.stop();
+  }
+
+  if (!sendDataToFirebase("/fan/auto_mode", 1.0)) {
+    return;
+  }
+}
+
+void controlFanManual() {
+  bool fanStatus;
+  if (Firebase.getBool(firebaseData, "/fan/status")) {
+    fanStatus = firebaseData.boolData();
+    Serial.print("Fan status updated to: ");
+    Serial.println(fanStatus);
+  } else {
+    Serial.print("Failed to get fan status: ");
+    Serial.println(firebaseData.errorReason());
+    return;
+  }
+
+  if (fanStatus) {
+    int fanSpeed;
+    if (Firebase.getInt(firebaseData, "/fan/speed")) {
+      fanSpeed = firebaseData.intData();
+      Serial.print("Fan speed updated to: ");
+      Serial.println(fanSpeed);
+      changeSpeed(fanSpeed);
+    } else {
+      Serial.print("Failed to get fan speed: ");
+      Serial.println(firebaseData.errorReason());
+    }
+  } else {
+    motor.stop();
+  }
+}
+
+void changeSpeed(int fanSpeed) {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  
+  int speed = 0;
+
+  switch (fanSpeed) {
+    case 0:
+      speed = 64; // Level 1
+      break;
+    case 1:
+      speed = 128; // Level 2
+      break;
+    case 2:
+      speed = 192; // Level 3
+      break;
+    case 3:
+      speed = 255; // Level 4
+      break;
+    default:
+      Serial.println("Invalid fan speed level!");
+      return;
+  }
+
+  analogWrite(ENA, speed);
+}
